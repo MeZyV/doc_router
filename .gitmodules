@@ -1,0 +1,8 @@
+[submodule "mineru/upstream"]
+	path = mineru/upstream
+	url = https://github.com/opendatalab/MinerU.git
+	branch = master
+	shallow = true
+	# Sparse-checkout (docker/global/ only) is configured after clone:
+	#   git -C mineru/upstream sparse-checkout init --cone
+	#   git -C mineru/upstream sparse-checkout set docker/global

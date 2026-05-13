@@ -1,0 +1,176 @@
+services:
+  # =========================
+  # MinerU GPU Router
+  # Dockerfile is sourced via a git submodule (sparse-checkout) under
+  # ./mineru/upstream. To refresh from upstream:
+  #   git submodule update --remote mineru/upstream
+  # =========================
+  mineru-router:
+    build:
+      context: ./mineru
+      dockerfile: Dockerfile
+    image: mineru:local
+    container_name: mineru-router
+    restart: always
+    environment:
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
+      NVIDIA_VISIBLE_DEVICES: "0,1"
+      CUDA_VISIBLE_DEVICES: "0,1"
+    entrypoint: mineru-router
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8002"
+      - --local-gpus
+      - auto
+      # Uncomment if VRAM pressure is too high.
+      # - --gpu-memory-utilization
+      # - "0.85"
+      # Optional warmup if supported by the installed MinerU image.
+      # - --enable-vlm-preload
+      # - "true"
+    ports:
+      - "8002:8002"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+      nofile:
+        soft: 65536
+        hard: 65536
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1"]
+              capabilities: [gpu]
+
+  # =========================
+  # Lightweight PDF parser
+  # Disabled in the default flow: doc-router runs pymupdf4llm in-process to
+  # avoid double-opening PDFs. Set USE_REMOTE_PYMUPDF=true on doc-router to
+  # route through this service instead. Kept available as an opt-in fallback.
+  # =========================
+  pymupdf4llm-api:
+    build:
+      context: ./pymupdf4llm-api
+      dockerfile: Dockerfile
+    container_name: pymupdf4llm-api
+    profiles: ["remote-pymupdf"]
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      TMP_DIR: /tmp/pymupdf4llm
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./tmp/pymupdf4llm:/tmp/pymupdf4llm
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # =========================
+  # CPU generic parser
+  # Office / HTML / TXT / fallback
+  # =========================
+  tika:
+    image: apache/tika:latest-full
+    container_name: tika
+    restart: unless-stopped
+    environment:
+      JAVA_OPTS: "-Xms1g -Xmx6g"
+    ports:
+      - "9998:9998"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9998/tika || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # =========================
+  # OpenWebUI External API router
+  # Exposes PUT /process
+  # =========================
+  doc-router:
+    build:
+      context: ./doc-router
+      dockerfile: Dockerfile
+    container_name: doc-router
+    restart: unless-stopped
+    depends_on:
+      mineru-router:
+        condition: service_healthy
+      tika:
+        condition: service_healthy
+    environment:
+      MINERU_ROUTER_URL: http://mineru-router:8002
+      PYMUPDF4LLM_URL: http://pymupdf4llm-api:8000
+      TIKA_URL: http://tika:9998
+      TMP_DIR: /tmp/doc-router
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # PDF scanned detection.
+      PDF_MIN_TEXT_CHARS: ${PDF_MIN_TEXT_CHARS:-150}
+      PDF_SCAN_SAMPLE_PAGES: ${PDF_SCAN_SAMPLE_PAGES:-3}
+
+      # Per-process concurrency guards.
+      MINERU_MAX_CONCURRENCY: ${MINERU_MAX_CONCURRENCY:-2}
+      PYMUPDF_MAX_CONCURRENCY: ${PYMUPDF_MAX_CONCURRENCY:-4}
+      TIKA_MAX_CONCURRENCY: ${TIKA_MAX_CONCURRENCY:-4}
+
+      # Per-upstream timeouts (seconds).
+      PYMUPDF_TIMEOUT_SECONDS: ${PYMUPDF_TIMEOUT_SECONDS:-300}
+      TIKA_TIMEOUT_SECONDS: ${TIKA_TIMEOUT_SECONDS:-300}
+      MINERU_TIMEOUT_SECONDS: ${MINERU_TIMEOUT_SECONDS:-1700}
+
+      # Upstream retries (502/503/504 + transport errors).
+      UPSTREAM_RETRIES: ${UPSTREAM_RETRIES:-1}
+      UPSTREAM_RETRY_BACKOFF_SECONDS: ${UPSTREAM_RETRY_BACKOFF_SECONDS:-0.5}
+
+      # Use in-process pymupdf4llm (default) or route to pymupdf4llm-api.
+      USE_REMOTE_PYMUPDF: ${USE_REMOTE_PYMUPDF:-false}
+
+      # Optional shared secret expected as: Authorization: Bearer <value>
+      EXTERNAL_API_KEY: ${EXTERNAL_API_KEY:-}
+    volumes:
+      - ./tmp/doc-router:/tmp/doc-router
+    ports:
+      - "8000:8000"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      # /health/live stays open; /health/ready requires EXTERNAL_API_KEY when
+      # set, so we use the lightweight probe here.
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health/live || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  default:
+    name: owui-doc-parsing
